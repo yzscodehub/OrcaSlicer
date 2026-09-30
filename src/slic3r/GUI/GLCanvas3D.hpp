@@ -6,11 +6,11 @@
 #include <memory>
 #include <chrono>
 #include <cstdint>
-#include <array>
 #include <optional>
 
 #include "GLToolbar.hpp"
 #include "GLPickingBuffer.hpp"
+#include "GLAOPass.hpp"
 #include "Event.hpp"
 #include "Selection.hpp"
 #include "ThumbnailView.hpp"     // ThumbnailView enum (kept lightweight, separate from this header)
@@ -662,6 +662,23 @@ private:
     bool m_dirty;
     // Requests a frame that may reuse the cached main scene.
     bool m_overlayDirty{ false };
+    GLAOPass m_ao_pass;
+    int m_ao_comparison_stage{0}; // 0 idle, 1 measuring, 2 capturing
+    bool m_ao_comparison_filter{false};
+    bool m_ao_comparison_denoise{false};
+    bool m_ao_comparison_sampling{false};
+    bool m_ao_comparison_composite{false};
+    bool m_ao_comparison_confidence{false};
+    bool m_ao_comparison_backends{false}; // Compare CS/FS instead of CS sampling variants.
+    int m_ao_comparison_run{0}; // Three alternating default/directions pairs.
+    std::string m_ao_comparison_root, m_ao_comparison_signature, m_ao_comparison_capture;
+    void finish_ao_comparison(const std::string& reason);
+    bool next_ao_comparison_run();
+    void advance_ao_comparison();
+
+    bool m_ao_benchmark_reuse{false}; // Benchmark variant only; normal rendering uses the validated reuse shader.
+    bool m_ao_benchmark_filter_reuse{false}; // Benchmark variant only; normal rendering uses the validated reuse filter.
+    bool     m_ao_benchmark_pipeline{false};     // Unified tests measure the complete selected pipeline.
     bool m_initialized;
     //BBS: add flag to controll rendering
     bool m_render_preview{ true };
@@ -839,7 +856,8 @@ public:
 
     bool is_initialized() const { return m_initialized; }
 
-    void set_context(wxGLContext* context) { m_context = context; }
+    void set_context(wxGLContext* context);
+    const std::string& get_ao_failure_reason() const { return m_ao_pass.failure_reason(); }
     void set_type(ECanvasType type) { if (m_canvas_type != type) InvalidateSceneAndPickingCaches(); m_canvas_type = type; }
     ECanvasType get_canvas_type() { return m_canvas_type; }
 
@@ -1408,7 +1426,7 @@ private:
     /** @brief Copies cached color and depth into the window framebuffer. */
     bool PresentSceneCache();
     /** @brief Draws the cacheable View3D scene content directly into the current window framebuffer. */
-    void RenderMainSceneContent(const Camera& camera, const MainSceneRenderParams& params);
+    bool RenderMainSceneContent(const Camera& camera, const MainSceneRenderParams& params);
     /** @brief Draws the selection box after scene presentation with explicit depth and blend state. */
     void RenderSelectionBoxWithExplicitState();
     bool RenderPickingBuffer(const Camera& camera);
@@ -1432,9 +1450,9 @@ private:
     void _render_background();
     void _render_bed(const Transform3d& view_matrix, const Transform3d& projection_matrix, bool bottom, bool show_axes);
     //BBS: add part plate related logic
-    void _render_platelist(const Transform3d& view_matrix, const Transform3d& projection_matrix, bool bottom, bool only_current, bool only_body = false, int hover_id = -1, bool render_cali = false, bool show_grid = true);
+    void _render_platelist(const Transform3d& view_matrix, const Transform3d& projection_matrix, bool bottom, bool only_current, bool only_body = false, int hover_id = -1, bool render_cali = false, bool show_grid = true, SceneRenderStage stage = SceneRenderStage::Legacy);
     //BBS: add outline drawing logic
-    void _render_objects(GLVolumeCollection::ERenderType type, bool with_outline = true);
+    void _render_objects(GLVolumeCollection::ERenderType type, bool with_outline = true, bool surface_only = false);
     //BBS: GUI refactor: add canvas size as parameters
     void _render_gcode(int canvas_width, int canvas_height);
     //BBS: render a plane for assemble

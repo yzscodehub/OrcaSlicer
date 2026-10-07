@@ -3194,7 +3194,7 @@ void GLCanvas3D::render(bool only_init, bool overlayOnly)
                   << "\nfilter_variant=" << (m_ao_benchmark_filter_reuse ? "reuse" : "baseline")
                   << "\nbenchmark_scope=" << (m_ao_benchmark_pipeline ? "pipeline" : "fs_variant")
                   << "\nrequested_backend=" << (std::getenv("ORCA_AO_BACKEND") ? std::getenv("ORCA_AO_BACKEND") : "auto")
-                  << "\ncs_denoise_passes=" << (std::getenv("ORCA_AO_CS_DENOISE") ? std::getenv("ORCA_AO_CS_DENOISE") : "2")
+                  << "\ncs_denoise_passes=" << (std::getenv("ORCA_AO_CS_DENOISE") ? std::getenv("ORCA_AO_CS_DENOISE") : "quality_default")
                   << "\nview=" << camera.get_view_matrix().matrix() << "\nprojection=" << camera.get_projection_matrix().matrix();
         GLint samples = 0;
         glGetIntegerv(GL_SAMPLES, &samples);
@@ -8842,11 +8842,17 @@ bool GLCanvas3D::RenderMainSceneContent(const Camera& camera, const MainSceneRen
                                         (m_ao_comparison_filter && (m_ao_comparison_sampling || m_ao_comparison_denoise || m_ao_comparison_run % 2));
         }
         ao_settings.force_cs = m_ao_comparison_stage && !m_ao_comparison_filter && !(m_ao_comparison_backends && m_ao_comparison_run % 2);
-        ao_settings.cs_slices_override = m_ao_comparison_stage ? (m_ao_comparison_backends || m_ao_comparison_composite || m_ao_comparison_confidence ? 3 : (m_ao_comparison_run % 2 ? 6 : 3)) : 0;
-        ao_settings.force_fs = (m_ao_comparison_stage && (m_ao_comparison_filter || (m_ao_comparison_backends && m_ao_comparison_run % 2))) ||
+        // Backend comparisons follow the current quality preset. The isolated CS
+        // diagnostic comparisons keep their explicit 3/6-slice sampling contract.
+        ao_settings.cs_slices_override = 0;
+        if (m_ao_comparison_stage && !m_ao_comparison_backends)
+            ao_settings.cs_slices_override = m_ao_comparison_composite || m_ao_comparison_confidence ? 3 :
+                                                                                                       (m_ao_comparison_run % 2 ? 6 : 3);
+        ao_settings.force_fs = (m_ao_comparison_stage &&
+                                (m_ao_comparison_filter || (m_ao_comparison_backends && m_ao_comparison_run % 2))) ||
                                (m_ao_pass.benchmark.active() && !m_ao_benchmark_pipeline);
-        const std::string debug_view      = wxGetApp().app_config->get("render_ao_debug");
-        ao_settings.debug_view            = debug_view == "depth" ? 1 : debug_view == "normal" ? 2 : debug_view == "ao" ? 3 : 0;
+        const std::string debug_view = wxGetApp().app_config->get("render_ao_debug");
+        ao_settings.debug_view       = debug_view == "depth" ? 1 : debug_view == "normal" ? 2 : debug_view == "ao" ? 3 : 0;
         // A missing receiver shader must report the same unavailable state as a missing postprocess shader.
         GLShaderProgram* normal_shader = wxGetApp().get_shader("ao_depth") ? wxGetApp().get_shader("ao_normal") : nullptr;
         if (ao_frame.composite_reference &&

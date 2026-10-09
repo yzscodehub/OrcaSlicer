@@ -15561,17 +15561,9 @@ msgid "Ambient occlusion"
 msgstr "环境光遮蔽"
 
 #: src/slic3r/GUI/Preferences.cpp
-msgid "Ambient occlusion strength"
-msgstr "环境光遮蔽强度"
-
-#: src/slic3r/GUI/Preferences.cpp
-msgid "Controls contact shading strength independently of quality. 60% is the default. 0% preserves the original colors."
-msgstr "独立于画质控制接触阴影的强度，默认为 60%。0% 保留原始颜色。"
-
-#: src/slic3r/GUI/Preferences.cpp
 msgid "Ambient occlusion unavailable"
 msgstr "环境光遮蔽不可用"
 
 #: src/slic3r/GUI/Preferences.cpp
-msgid "Adds contact shading in the Prepare view. Auto uses conservative quality. Specialized editing modes use the original rendering."
-msgstr "在准备视图中添加接触阴影。自动模式采用保守画质。特殊编辑模式保持原有渲染。"
+msgid "Adds contact shading in the Prepare view. Auto uses Medium quality. Strength is fixed at 50%. Specialized editing modes use the original rendering."
+msgstr "在准备视图中添加接触阴影。自动模式采用中等画质，强度固定为 50%。特殊编辑模式保持原有渲染。"

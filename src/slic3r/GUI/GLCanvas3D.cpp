@@ -1695,8 +1695,14 @@ void GLCanvas3D::finish_ao_comparison(const std::string& reason)
 
 bool GLCanvas3D::next_ao_comparison_run()
 {
+    const char* quality_names[] = {"low", "medium", "high"};
     const std::string name = std::to_string(m_ao_comparison_run + 1) +
-                            (m_ao_comparison_confidence ? (m_ao_comparison_run % 2 ? "-confidence-precomputed" : "-confidence-direct") :
+                            (m_ao_comparison_low ? (m_ao_comparison_run % 2 ? "-cs-low-normalized" : "-cs-low-legacy") :
+                             m_ao_comparison_qualities ? std::string(m_ao_comparison_run % 2 ? "-fs-" : "-cs-") + quality_names[m_ao_comparison_run / 2] :
+                             m_ao_comparison_reconstruction ? (m_ao_comparison_run % 2 ? "-fs-xy" : "-fs-matrix") :
+                             m_ao_comparison_pixel ? (m_ao_comparison_run % 2 ? "-composite-pixel" : "-composite-sample") :
+                             m_ao_comparison_split ? (m_ao_comparison_run % 2 ? "-composite-split" : "-composite-direct") :
+                             m_ao_comparison_confidence ? (m_ao_comparison_run % 2 ? "-confidence-precomputed" : "-confidence-direct") :
                              m_ao_comparison_composite ? (m_ao_comparison_run % 2 ? "-composite-optimized" : "-composite-reference") :
                              m_ao_comparison_sampling ? (m_ao_comparison_run % 2 ? "-fs-3x8" : "-fs-4x8") :
                              m_ao_comparison_denoise ? (m_ao_comparison_run % 2 ? "-fs-edges3" : "-fs-edges2") :
@@ -1723,12 +1729,17 @@ void GLCanvas3D::advance_ao_comparison()
         m_ao_comparison_stage = 2;
     } else if (m_ao_comparison_stage == 2) {
         std::error_code error;
-        const char* expected_backend = m_ao_comparison_filter || (m_ao_comparison_backends && m_ao_comparison_run % 2) ? "fs" : "cs";
+        const char* expected_backend = m_ao_comparison_reconstruction || m_ao_comparison_pixel_fs || m_ao_comparison_filter || (m_ao_comparison_backends && m_ao_comparison_run % 2) ? "fs" : "cs";
         if (std::string(m_ao_pass.backend()) != expected_backend ||
             (m_ao_comparison_filter && m_ao_pass.fs_edge_filter_active() != (m_ao_comparison_sampling || m_ao_comparison_denoise || bool(m_ao_comparison_run % 2))) ||
             (m_ao_comparison_denoise && m_ao_pass.fs_edge_passes() != (m_ao_comparison_run % 2 ? 3 : 2)) ||
             (m_ao_comparison_sampling && (m_ao_pass.actual_slices() != (m_ao_comparison_run % 2 ? 3 : 4) || m_ao_pass.fs_edge_passes() != 3)) ||
             (m_ao_comparison_confidence && m_ao_pass.precomputed_confidence_active() != bool(m_ao_comparison_run % 2)) ||
+            (m_ao_comparison_split && m_ao_pass.split_composite_active() != bool(m_ao_comparison_run % 2)) ||
+            (m_ao_comparison_pixel && m_ao_pass.pixel_composite_active() != bool(m_ao_comparison_run % 2)) ||
+            (m_ao_comparison_reconstruction && m_ao_pass.fast_reconstruction_active() != bool(m_ao_comparison_run % 2)) ||
+            (m_ao_comparison_qualities && m_ao_pass.actual_quality() != static_cast<GLAOPass::Quality>(1 + m_ao_comparison_run / 2)) ||
+            (m_ao_comparison_low && (m_ao_pass.actual_quality() != GLAOPass::Quality::Low || m_ao_pass.cs_low_reference_active() != (m_ao_comparison_run % 2 == 0))) ||
             !std::filesystem::exists(std::filesystem::path(m_ao_comparison_capture) / "capture-complete.txt", error) || error) {
             finish_ao_comparison("ABORTED: image capture failed or requested backend unavailable");
             return;
@@ -3187,7 +3198,7 @@ void GLCanvas3D::render(bool only_init, bool overlayOnly)
         std::ostringstream signature;
         signature.imbue(std::locale::classic());
         signature << std::setprecision(17) << "viewport=" << cnv_size.get_width() << 'x' << cnv_size.get_height()
-                  << "\nquality=" << wxGetApp().app_config->get("render_ao_quality")
+                  << "\nui_quality=" << wxGetApp().app_config->get("render_ao_quality")
                   << "\nstrength=" << wxGetApp().app_config->get("render_ao_strength")
                   << "\ndebug=" << wxGetApp().app_config->get("render_ao_debug")
                   << "\nevaluation_variant=" << (m_ao_benchmark_reuse ? "reuse" : "baseline")
@@ -3212,6 +3223,9 @@ void GLCanvas3D::render(bool only_init, bool overlayOnly)
                 finish_ao_comparison("ABORTED: comparison view or settings changed");
             }
         }
+        const char* quality_names[] = {"low", "medium", "high"};
+        signature << "\nquality=" << (m_ao_comparison_stage && m_ao_comparison_low ? "low" : m_ao_comparison_stage && m_ao_comparison_qualities ?
+                                          quality_names[m_ao_comparison_run / 2] : wxGetApp().app_config->get("render_ao_quality"));
         m_ao_pass.benchmark.begin(signature.str());
         fullSceneRefresh = true;
     }
@@ -5076,7 +5090,13 @@ void GLCanvas3D::on_key(wxKeyEvent& evt)
                 std::error_code error;
                 if (std::filesystem::create_directories(m_ao_comparison_root, error) && !error) {
                     const char* mode = std::getenv("ORCA_AO_COMPARISON_MODE");
-                    m_ao_comparison_backends = mode && std::string(mode) == "backends";
+                    m_ao_comparison_low = mode && std::string(mode) == "cslow";
+                    m_ao_comparison_qualities = mode && std::string(mode) == "qualities";
+                    m_ao_comparison_backends = m_ao_comparison_qualities || (mode && std::string(mode) == "backends");
+                    m_ao_comparison_reconstruction = mode && std::string(mode) == "fseval";
+                    m_ao_comparison_pixel_fs = mode && std::string(mode) == "pixelfs";
+                    m_ao_comparison_pixel = m_ao_comparison_pixel_fs || (mode && std::string(mode) == "pixel");
+                    m_ao_comparison_split = mode && std::string(mode) == "split";
                     m_ao_comparison_confidence = mode && std::string(mode) == "confidence";
                     m_ao_comparison_composite = mode && std::string(mode) == "composite";
                     m_ao_comparison_sampling = mode && std::string(mode) == "fssampling";
@@ -5088,8 +5108,8 @@ void GLCanvas3D::on_key(wxKeyEvent& evt)
                     m_ao_benchmark_pipeline = m_ao_benchmark_reuse = m_ao_benchmark_filter_reuse = true;
                     m_ao_pass.request_capture("");
                     std::ofstream status(std::filesystem::path(m_ao_comparison_root) / "status.txt");
-                    status << "RUNNING: three alternating " << (m_ao_comparison_confidence ? "CS direct/precomputed confidence" : m_ao_comparison_composite ? "CS reference/optimized composite" : m_ao_comparison_sampling ? "FS 4x8/3x8 with three denoise passes" : m_ao_comparison_denoise ? "FS connectivity 2/3 passes" : m_ao_comparison_filter ? "FS geometry/connectivity" : m_ao_comparison_backends ? "CS/FS" : "default/directions")
-                           << " pairs; 30 warmup + 180 measured per run.\n"
+                    status << (m_ao_comparison_qualities ? "RUNNING: six quality configurations; " : "RUNNING: three alternating ") << (m_ao_comparison_low ? "CS Low legacy/normalized unoccluded slice" : m_ao_comparison_qualities ? "CS/FS Low, Medium, High" : m_ao_comparison_reconstruction ? "FS matrix/separable XY reconstruction" : m_ao_comparison_pixel ? (m_ao_comparison_pixel_fs ? "FS sample/pixel composite" : "CS sample/pixel composite") : m_ao_comparison_split ? "CS direct/split MSAA composite" : m_ao_comparison_confidence ? "CS direct/precomputed confidence" : m_ao_comparison_composite ? "CS reference/optimized composite" : m_ao_comparison_sampling ? "FS 4x8/3x8 with three denoise passes" : m_ao_comparison_denoise ? "FS connectivity 2/3 passes" : m_ao_comparison_filter ? "FS geometry/connectivity" : m_ao_comparison_backends ? "CS/FS" : "default/directions")
+                           << "; 30 warmup + 180 measured per run.\n"
                            << "Images captured after timing. Do not change view, settings or scene.\n";
                     status.close();
                     if (status) next_ao_comparison_run();
@@ -8799,6 +8819,10 @@ bool GLCanvas3D::RenderMainSceneContent(const Camera& camera, const MainSceneRen
         ao_settings.quality = GLAOPass::resolve_quality(wxGetApp().app_config->get("render_ao_quality"),
                                                         OpenGLManager::get_gl_info().get_renderer());
     }
+    if (m_ao_comparison_stage && m_ao_comparison_qualities && ao_settings.quality != GLAOPass::Quality::Off)
+        ao_settings.quality = static_cast<GLAOPass::Quality>(1 + m_ao_comparison_run / 2);
+    if (m_ao_comparison_stage && m_ao_comparison_low && ao_settings.quality != GLAOPass::Quality::Off)
+        ao_settings.quality = GLAOPass::Quality::Low;
     GLAOPass::Frame ao_frame;
     bool            ao_ready = false;
     if (ao_settings.quality == GLAOPass::Quality::Off)
@@ -8817,13 +8841,32 @@ bool GLCanvas3D::RenderMainSceneContent(const Camera& camera, const MainSceneRen
                                        composite_variant && std::string(composite_variant) == "reference";
         ao_frame.precomputed_confidence = m_ao_comparison_stage ? (m_ao_comparison_confidence && m_ao_comparison_run % 2) :
                                           composite_variant && std::string(composite_variant) == "confidence";
+        // Per-pixel AO is the production default; "sample"/"optimized" retain
+        // the per-sample path. Isolated A/B modes keep their original baselines.
+        const bool default_pixel = !composite_variant || composite_variant[0] == '\0' || std::string(composite_variant) == "pixel";
+        ao_frame.pixel_composite = m_ao_comparison_stage ? (m_ao_comparison_low || m_ao_comparison_reconstruction || m_ao_comparison_backends || (m_ao_comparison_pixel && m_ao_comparison_run % 2)) :
+                                                         default_pixel;
+        ao_frame.require_msaa_comparison = m_ao_comparison_stage && m_ao_comparison_pixel;
+        ao_frame.split_composite = m_ao_comparison_stage ? (m_ao_comparison_split && m_ao_comparison_run % 2) :
+                                   composite_variant && std::string(composite_variant) == "split";
+        ao_frame.split_classify = wxGetApp().get_shader("ao_msaa_classify");
+        ao_frame.split_fast = wxGetApp().get_shader("ao_msaa_fast");
+        ao_frame.split_edges = wxGetApp().get_shader("ao_msaa_edges");
         ao_frame.confidence_normal = wxGetApp().get_shader("ao_normal_confidence");
         ao_frame.confidence_composite = wxGetApp().get_shader("ao_composite_confidence");
         ao_frame.confidence_sample_composite = wxGetApp().get_shader("ao_composite_msaa_confidence");
         ao_frame.sample_composite = wxGetApp().get_shader(ao_frame.composite_reference ? "ao_composite_msaa_reference" : "ao_composite_msaa");
+        const char* low_mode = std::getenv("ORCA_AO_CS_LOW");
+        ao_frame.cs_low_reference = ao_settings.quality == GLAOPass::Quality::Low &&
+                                   (m_ao_comparison_stage ? (m_ao_comparison_low && m_ao_comparison_run % 2 == 0) :
+                                                           low_mode && std::string(low_mode) == "legacy");
         ao_frame.compute_shaders          = {
-            {wxGetApp().get_shader("xegtao_depth"), wxGetApp().get_shader("xegtao_main"), wxGetApp().get_shader("xegtao_denoise")}};
+            {wxGetApp().get_shader("xegtao_depth"), wxGetApp().get_shader(ao_frame.cs_low_reference ? "xegtao_main_legacy_low" : "xegtao_main"), wxGetApp().get_shader("xegtao_denoise")}};
         ao_frame.edge_evaluate = wxGetApp().get_shader("gtao_edges");
+        ao_frame.edge_evaluate_xy = wxGetApp().get_shader("gtao_edges_xy");
+        const char* reconstruction = std::getenv("ORCA_AO_FS_RECONSTRUCTION");
+        ao_frame.fast_reconstruction = m_ao_comparison_stage ? (m_ao_comparison_reconstruction && m_ao_comparison_run % 2) :
+                                       reconstruction && std::string(reconstruction) == "fast";
         ao_frame.edge_denoise = wxGetApp().get_shader("ao_denoise_connectivity");
         const char* fs_filter = std::getenv("ORCA_AO_FS_FILTER");
         const char* fs_passes = std::getenv("ORCA_AO_FS_DENOISE");
@@ -8835,21 +8878,21 @@ bool GLCanvas3D::RenderMainSceneContent(const Camera& camera, const MainSceneRen
         ao_settings.fs_edge_passes = fs_passes && std::string(fs_passes) == "2" ? 2 : 3;
         ao_settings.fs_slices_override = geometry_filter || (fs_sampling && std::string(fs_sampling) == "directions4") ? 0 : 3;
         if (m_ao_comparison_stage) {
-            ao_settings.fs_slices_override = m_ao_comparison_backends || (m_ao_comparison_sampling && m_ao_comparison_run % 2) ? 3 : 0;
-            ao_settings.fs_edge_passes = m_ao_comparison_backends || m_ao_comparison_sampling ||
+            ao_settings.fs_slices_override = m_ao_comparison_reconstruction || m_ao_comparison_pixel_fs || m_ao_comparison_backends || (m_ao_comparison_sampling && m_ao_comparison_run % 2) ? 3 : 0;
+            ao_settings.fs_edge_passes = m_ao_comparison_reconstruction || m_ao_comparison_pixel_fs || m_ao_comparison_backends || m_ao_comparison_sampling ||
                                         (m_ao_comparison_denoise && m_ao_comparison_run % 2) ? 3 : 2;
-            ao_settings.fs_edge_filter = m_ao_comparison_backends ||
+            ao_settings.fs_edge_filter = m_ao_comparison_reconstruction || m_ao_comparison_pixel_fs || m_ao_comparison_backends ||
                                         (m_ao_comparison_filter && (m_ao_comparison_sampling || m_ao_comparison_denoise || m_ao_comparison_run % 2));
         }
-        ao_settings.force_cs = m_ao_comparison_stage && !m_ao_comparison_filter && !(m_ao_comparison_backends && m_ao_comparison_run % 2);
+        ao_settings.force_cs = m_ao_comparison_stage && !m_ao_comparison_reconstruction && !m_ao_comparison_pixel_fs && !m_ao_comparison_filter && !(m_ao_comparison_backends && m_ao_comparison_run % 2);
         // Backend comparisons follow the current quality preset. The isolated CS
         // diagnostic comparisons keep their explicit 3/6-slice sampling contract.
         ao_settings.cs_slices_override = 0;
-        if (m_ao_comparison_stage && !m_ao_comparison_backends)
-            ao_settings.cs_slices_override = m_ao_comparison_composite || m_ao_comparison_confidence ? 3 :
+        if (m_ao_comparison_stage && !m_ao_comparison_backends && !m_ao_comparison_pixel)
+            ao_settings.cs_slices_override = m_ao_comparison_composite || m_ao_comparison_confidence || m_ao_comparison_split ? 3 :
                                                                                                        (m_ao_comparison_run % 2 ? 6 : 3);
         ao_settings.force_fs = (m_ao_comparison_stage &&
-                                (m_ao_comparison_filter || (m_ao_comparison_backends && m_ao_comparison_run % 2))) ||
+                                (m_ao_comparison_reconstruction || m_ao_comparison_pixel_fs || m_ao_comparison_filter || (m_ao_comparison_backends && m_ao_comparison_run % 2))) ||
                                (m_ao_pass.benchmark.active() && !m_ao_benchmark_pipeline);
         const std::string debug_view = wxGetApp().app_config->get("render_ao_debug");
         ao_settings.debug_view       = debug_view == "depth" ? 1 : debug_view == "normal" ? 2 : debug_view == "ao" ? 3 : 0;

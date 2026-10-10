@@ -8945,69 +8945,82 @@ bool GLCanvas3D::RenderMainSceneContent(const Camera& camera, const MainSceneRen
         ao_frame.pixel_composite = m_ao_comparison_stage ? (m_ao_comparison_low || m_ao_comparison_reconstruction || m_ao_comparison_backends || (m_ao_comparison_pixel && m_ao_comparison_run % 2)) :
                                                          default_pixel;
         ao_frame.require_msaa_comparison = m_ao_comparison_stage && m_ao_comparison_pixel;
-        ao_frame.split_composite = m_ao_comparison_stage ? (m_ao_comparison_split && m_ao_comparison_run % 2) :
-                                   composite_variant && std::string(composite_variant) == "split";
-        ao_frame.split_classify = wxGetApp().get_shader("ao_msaa_classify");
-        ao_frame.split_fast = wxGetApp().get_shader("ao_msaa_fast");
-        ao_frame.split_edges = wxGetApp().get_shader("ao_msaa_edges");
-        ao_frame.confidence_normal = wxGetApp().get_shader("ao_normal_confidence");
-        ao_frame.confidence_composite = wxGetApp().get_shader("ao_composite_confidence");
-        ao_frame.confidence_sample_composite = wxGetApp().get_shader("ao_composite_msaa_confidence");
-        ao_frame.sample_composite = wxGetApp().get_shader(ao_frame.composite_reference ? "ao_composite_msaa_reference" : "ao_composite_msaa");
-        const char* low_mode = std::getenv("ORCA_AO_CS_LOW");
-        ao_frame.cs_low_reference = ao_settings.quality == GLAOPass::Quality::Low &&
-                                   (m_ao_comparison_stage ? (m_ao_comparison_low && m_ao_comparison_run % 2 == 0) :
-                                                           low_mode && std::string(low_mode) == "legacy");
-        ao_frame.compute_shaders          = {
-            {wxGetApp().get_shader("xegtao_depth"), wxGetApp().get_shader(ao_frame.cs_low_reference ? "xegtao_main_legacy_low" : "xegtao_main"), wxGetApp().get_shader("xegtao_denoise")}};
-        ao_frame.edge_evaluate = wxGetApp().get_shader("gtao_edges");
-        ao_frame.edge_evaluate_xy = wxGetApp().get_shader("gtao_edges_xy");
-        const char* reconstruction = std::getenv("ORCA_AO_FS_RECONSTRUCTION");
+        ao_frame.split_composite             = m_ao_comparison_stage ? (m_ao_comparison_split && m_ao_comparison_run % 2) :
+                                                                       composite_variant && std::string(composite_variant) == "split";
+        ao_frame.split_classify              = wxGetApp().get_shader("ao_classify_sample_surfaces");
+        ao_frame.split_fast                  = wxGetApp().get_shader("ao_composite_color_pixel_fast");
+        ao_frame.split_edges                 = wxGetApp().get_shader("ao_composite_color_sample_edges");
+        ao_frame.confidence_normal           = wxGetApp().get_shader("ao_reconstruct_view_normals_confidence");
+        ao_frame.confidence_composite        = wxGetApp().get_shader("ao_composite_color_pixel_confidence");
+        ao_frame.confidence_sample_composite = wxGetApp().get_shader("ao_composite_color_sample_confidence");
+        ao_frame.sample_composite            = wxGetApp().get_shader(ao_frame.composite_reference ? "ao_composite_color_sample_reference" :
+                                                                                                    "ao_composite_color_sample");
+        const char* low_mode                 = std::getenv("ORCA_AO_CS_LOW");
+        ao_frame.cs_low_reference            = ao_settings.quality == GLAOPass::Quality::Low &&
+                                    (m_ao_comparison_stage ? (m_ao_comparison_low && m_ao_comparison_run % 2 == 0) :
+                                                             low_mode && std::string(low_mode) == "legacy");
+        ao_frame.compute_shaders     = {{wxGetApp().get_shader("ao_prefilter_depth_mips"),
+                                         wxGetApp().get_shader(ao_frame.cs_low_reference ? "ao_evaluate_visibility_edges_legacy_low_cs" :
+                                                                                           "ao_evaluate_visibility_edges_cs"),
+                                         wxGetApp().get_shader("ao_denoise_visibility_edge_guided_cs")}};
+        ao_frame.edge_evaluate       = wxGetApp().get_shader("ao_evaluate_visibility_edges_fs");
+        ao_frame.edge_evaluate_xy    = wxGetApp().get_shader("ao_evaluate_visibility_edges_xy_fs");
+        const char* reconstruction   = std::getenv("ORCA_AO_FS_RECONSTRUCTION");
         ao_frame.fast_reconstruction = m_ao_comparison_stage ? (m_ao_comparison_reconstruction && m_ao_comparison_run % 2) :
-                                       reconstruction && std::string(reconstruction) == "fast";
-        ao_frame.edge_denoise = wxGetApp().get_shader("ao_denoise_connectivity");
-        const char* fs_filter = std::getenv("ORCA_AO_FS_FILTER");
-        const char* fs_passes = std::getenv("ORCA_AO_FS_DENOISE");
-        const char* fs_sampling = std::getenv("ORCA_AO_FS_SAMPLING");
+                                                               reconstruction && std::string(reconstruction) == "fast";
+        ao_frame.edge_denoise        = wxGetApp().get_shader("ao_denoise_visibility_edge_guided_fs");
+        const char* fs_filter        = std::getenv("ORCA_AO_FS_FILTER");
+        const char* fs_passes        = std::getenv("ORCA_AO_FS_DENOISE");
+        const char* fs_sampling      = std::getenv("ORCA_AO_FS_SAMPLING");
         // Production High uses 3x8 plus three connectivity passes. Explicit geometry
         // restores the original 4x8 pipeline; the older A/B modes retain their settings.
-        const bool geometry_filter = fs_filter && std::string(fs_filter) == "geometry";
-        ao_settings.fs_edge_filter = !geometry_filter;
-        ao_settings.fs_edge_passes = fs_passes && std::string(fs_passes) == "2" ? 2 : 3;
+        const bool geometry_filter     = fs_filter && std::string(fs_filter) == "geometry";
+        ao_settings.fs_edge_filter     = !geometry_filter;
+        ao_settings.fs_edge_passes     = fs_passes && std::string(fs_passes) == "2" ? 2 : 3;
         ao_settings.fs_slices_override = geometry_filter || (fs_sampling && std::string(fs_sampling) == "directions4") ? 0 : 3;
         if (m_ao_comparison_stage) {
-            ao_settings.fs_slices_override = m_ao_comparison_reconstruction || m_ao_comparison_pixel_fs || m_ao_comparison_backends || (m_ao_comparison_sampling && m_ao_comparison_run % 2) ? 3 : 0;
-            ao_settings.fs_edge_passes = m_ao_comparison_reconstruction || m_ao_comparison_pixel_fs || m_ao_comparison_backends || m_ao_comparison_sampling ||
-                                        (m_ao_comparison_denoise && m_ao_comparison_run % 2) ? 3 : 2;
-            ao_settings.fs_edge_filter = m_ao_comparison_reconstruction || m_ao_comparison_pixel_fs || m_ao_comparison_backends ||
-                                        (m_ao_comparison_filter && (m_ao_comparison_sampling || m_ao_comparison_denoise || m_ao_comparison_run % 2));
+            ao_settings.fs_slices_override = m_ao_comparison_reconstruction || m_ao_comparison_pixel_fs || m_ao_comparison_backends ||
+                                                     (m_ao_comparison_sampling && m_ao_comparison_run % 2) ?
+                                                 3 :
+                                                 0;
+            ao_settings.fs_edge_passes     = m_ao_comparison_reconstruction || m_ao_comparison_pixel_fs || m_ao_comparison_backends ||
+                                                 m_ao_comparison_sampling || (m_ao_comparison_denoise && m_ao_comparison_run % 2) ?
+                                                 3 :
+                                                 2;
+            ao_settings.fs_edge_filter     = m_ao_comparison_reconstruction || m_ao_comparison_pixel_fs || m_ao_comparison_backends ||
+                                         (m_ao_comparison_filter &&
+                                          (m_ao_comparison_sampling || m_ao_comparison_denoise || m_ao_comparison_run % 2));
         }
-        ao_settings.force_cs = m_ao_comparison_stage && !m_ao_comparison_reconstruction && !m_ao_comparison_pixel_fs && !m_ao_comparison_filter && !(m_ao_comparison_backends && m_ao_comparison_run % 2);
+        ao_settings.force_cs = m_ao_comparison_stage && !m_ao_comparison_reconstruction && !m_ao_comparison_pixel_fs &&
+                               !m_ao_comparison_filter && !(m_ao_comparison_backends && m_ao_comparison_run % 2);
         // Backend comparisons follow the current quality preset. The isolated CS
         // diagnostic comparisons keep their explicit 3/6-slice sampling contract.
         ao_settings.cs_slices_override = 0;
         if (m_ao_comparison_stage && !m_ao_comparison_backends && !m_ao_comparison_pixel)
-            ao_settings.cs_slices_override = m_ao_comparison_composite || m_ao_comparison_confidence || m_ao_comparison_split ? 3 :
-                                                                                                       (m_ao_comparison_run % 2 ? 6 : 3);
+            ao_settings.cs_slices_override = m_ao_comparison_composite || m_ao_comparison_confidence || m_ao_comparison_split ?
+                                                 3 :
+                                                 (m_ao_comparison_run % 2 ? 6 : 3);
         ao_settings.force_fs = (m_ao_comparison_stage &&
-                                (m_ao_comparison_reconstruction || m_ao_comparison_pixel_fs || m_ao_comparison_filter || (m_ao_comparison_backends && m_ao_comparison_run % 2))) ||
+                                (m_ao_comparison_reconstruction || m_ao_comparison_pixel_fs || m_ao_comparison_filter ||
+                                 (m_ao_comparison_backends && m_ao_comparison_run % 2))) ||
                                (m_ao_pass.benchmark.active() && !m_ao_benchmark_pipeline);
         const std::string debug_view = wxGetApp().app_config->get("render_ao_debug");
         ao_settings.debug_view       = debug_view == "depth" ? 1 : debug_view == "normal" ? 2 : debug_view == "ao" ? 3 : 0;
         // Assembly has no bed receiver draw and therefore needs no receiver shader.
-        GLShaderProgram* normal_shader = wxGetApp().get_shader("ao_normal");
-        if (!assembly && !wxGetApp().get_shader("ao_depth"))
+        GLShaderProgram* normal_shader = wxGetApp().get_shader("ao_reconstruct_view_normals");
+        if (!assembly && !wxGetApp().get_shader("ao_render_receiver_depth"))
             normal_shader = nullptr;
-        if (ao_frame.composite_reference &&
-            (!wxGetApp().get_shader("ao_composite_reference") ||
-             (wxGetApp().is_gl_version_greater_or_equal_to(4, 0) && !ao_frame.sample_composite)))
+        if (ao_frame.composite_reference && (!wxGetApp().get_shader("ao_composite_color_pixel_reference") ||
+                                             (wxGetApp().is_gl_version_greater_or_equal_to(4, 0) && !ao_frame.sample_composite)))
             normal_shader = nullptr; // Abort the comparison rather than silently changing its MSAA path.
         const bool old_evaluation = m_ao_pass.benchmark.active() && !m_ao_benchmark_reuse;
-        const bool reuse_filter = !m_ao_pass.benchmark.active() || m_ao_benchmark_filter_reuse;
-        ao_ready                       = m_ao_pass.prepare(ao_frame, ao_settings,
-                                                           {{normal_shader, wxGetApp().get_shader(old_evaluation ? "gtao" : "gtao_reuse"),
-                                                             wxGetApp().get_shader(reuse_filter ? "ao_filter_reuse" : "ao_filter"),
-                                                             wxGetApp().get_shader("ao_upsample"), wxGetApp().get_shader(ao_frame.composite_reference ? "ao_composite_reference" : "ao_composite")}});
+        const bool reuse_filter   = !m_ao_pass.benchmark.active() || m_ao_benchmark_filter_reuse;
+        ao_ready                  = m_ao_pass.prepare(
+            ao_frame, ao_settings,
+            {{normal_shader, wxGetApp().get_shader(old_evaluation ? "ao_evaluate_visibility_reference_fs" : "ao_evaluate_visibility_fs"),
+                               wxGetApp().get_shader(reuse_filter ? "ao_denoise_visibility_geometry" : "ao_denoise_visibility_geometry_reference"),
+                               wxGetApp().get_shader("ao_upsample_visibility_bilateral"),
+                               wxGetApp().get_shader(ao_frame.composite_reference ? "ao_composite_color_pixel_reference" : "ao_composite_color_pixel")}});
     }
     if (!ao_ready) {
         if (ao_settings.quality != GLAOPass::Quality::Off)
@@ -9038,7 +9051,7 @@ bool GLCanvas3D::RenderMainSceneContent(const Camera& camera, const MainSceneRen
             return m_ao_pass.render(scene_frame, ao_settings, [&]() {
                 if (assembly)
                     return; // Use the opaque assembly depth, with no virtual ground receiver.
-                GLShaderProgram* shader = wxGetApp().get_shader("ao_depth");
+                GLShaderProgram* shader = wxGetApp().get_shader("ao_render_receiver_depth");
                 shader->start_using();
                 shader->set_uniform("view_model_matrix", camera.get_view_matrix());
                 shader->set_uniform("projection_matrix", camera.get_projection_matrix());

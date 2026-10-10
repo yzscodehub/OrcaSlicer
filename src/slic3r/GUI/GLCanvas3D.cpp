@@ -1646,7 +1646,7 @@ GLCanvas3D::~GLCanvas3D()
     if (contextCurrent)
         m_pickingBuffer.Reset();
     else
-        assert(!m_pickingBuffer.IsReady());
+        m_pickingBuffer.ForgetContext();
 
     if (contextCurrent && m_sceneCacheResources.framebuffer != 0)
         ReleaseSceneCacheResources();
@@ -1751,18 +1751,50 @@ void GLCanvas3D::advance_ao_comparison()
     }
 }
 
+void GLCanvas3D::on_view_deactivated()
+{
+    // Hidden canvases may have their selection queried while another view owns
+    // GLVolume's global display transform. Rebuild their bounds on activation.
+    m_explosionBoundsDirty = true;
+    m_ao_pass.request_capture("");
+    if (m_ao_pass.benchmark.active()) {
+        const bool context_current = m_canvas != nullptr && _set_current();
+        m_ao_pass.benchmark.finish("ABORTED: AO view deactivated", context_current);
+    }
+    finish_ao_comparison("ABORTED: AO view deactivated");
+}
+
 void GLCanvas3D::set_context(wxGLContext* context)
 {
-    if (context == m_context) return;
+    if (context == m_context)
+        return;
     finish_ao_comparison("ABORTED: context changed");
-    if (m_canvas != nullptr && _set_current()) {
-        m_ao_pass.benchmark.finish("ABORTED: context changed");
+    const bool old_context_current = m_canvas != nullptr && _set_current();
+    m_ao_pass.benchmark.finish("ABORTED: context changed", old_context_current);
+    if (old_context_current) {
         m_ao_pass.benchmark.release();
+        if (m_ao_pass.has_resources())
+            m_ao_pass.release();
+        ReleaseSceneCacheResources();
+        ReleaseSelectionHighlightResources();
+        m_pickingBuffer.Reset();
+    } else {
+        // Framebuffer names belong to the old context and cannot be reused by
+        // the new one, even if the window size and camera have not changed.
+        m_sceneCacheResources         = {};
+        m_selectionHighlightResources = {};
+        m_pickingBuffer.ForgetContext();
     }
     m_ao_pass.benchmark.forget();
-    if (m_ao_pass.has_resources() && m_canvas != nullptr && _set_current()) m_ao_pass.release();
     // If the old context cannot be made current, its destruction owns the remaining GL cleanup.
     m_ao_pass.forget_context();
+    m_sceneCacheCaptureValidated = m_sceneCachePresentValidated = false;
+    m_sceneCacheFailedWidth = m_sceneCacheFailedHeight = 0;
+    m_sceneCacheFailedSamples                          = -1;
+    m_sceneCacheHasAO = m_selectionHighlightValid = false;
+    m_selectionHighlightFailedWidth = m_selectionHighlightFailedHeight = 0;
+    m_selectionHighlightVolumeIndices.clear();
+    InvalidateSceneAndPickingCaches();
     m_context = context;
 }
 
@@ -3131,7 +3163,11 @@ void GLCanvas3D::render(bool only_init, bool overlayOnly)
         return;
 
     // ensures this canvas is current and initialized
-    if (!_is_shown_on_screen() || !_set_current() || !wxGetApp().init_opengl())
+    if (!_is_shown_on_screen()) {
+        on_view_deactivated();
+        return;
+    }
+    if (!_set_current() || !wxGetApp().init_opengl())
         return;
 
     if (!is_initialized() && !init())
@@ -3152,6 +3188,12 @@ void GLCanvas3D::render(bool only_init, bool overlayOnly)
         return;
 
     bool fullSceneRefresh = !overlayOnly || m_dirty;
+    // Explosion state is shared by GLVolume, but belongs to the active canvas.
+    // Restore it before camera bounds, picking and depth rendering on a view switch.
+    const float scene_explosion_ratio = m_canvas_type == CanvasAssembleView ? m_explosion_ratio : 1.0f;
+    if (ApplyExplosionRatio(scene_explosion_ratio)) {
+        fullSceneRefresh = true;
+    }
     GLint targetDrawFramebuffer = 0;
     if (OpenGLManager::get_framebuffers_type() == OpenGLManager::EFramebufferType::Arb)
         glsafe(::glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &targetDrawFramebuffer));
@@ -3190,14 +3232,17 @@ void GLCanvas3D::render(bool only_init, bool overlayOnly)
 
     camera.apply_projection(_max_bounding_box(true, true, true));
     camera.UpdateFrustum();
-    if (m_ao_comparison_stage && m_canvas_type != ECanvasType::CanvasView3D)
-        finish_ao_comparison("ABORTED: left 3D view");
-    if (m_ao_pass.benchmark.active() && m_canvas_type != ECanvasType::CanvasView3D)
-        m_ao_pass.benchmark.finish("ABORTED: left 3D view");
-    if ((m_ao_pass.benchmark.active() || m_ao_comparison_stage) && m_canvas_type == ECanvasType::CanvasView3D) {
+    if (m_ao_comparison_stage && !IsAOSceneView())
+        finish_ao_comparison("ABORTED: left AO-supported view");
+    if (m_ao_pass.benchmark.active() && !IsAOSceneView())
+        m_ao_pass.benchmark.finish("ABORTED: left AO-supported view");
+    if ((m_ao_pass.benchmark.active() || m_ao_comparison_stage) && IsAOSceneView()) {
         std::ostringstream signature;
         signature.imbue(std::locale::classic());
         signature << std::setprecision(17) << "viewport=" << cnv_size.get_width() << 'x' << cnv_size.get_height()
+                  << "\ncanvas=" << (m_canvas_type == CanvasAssembleView ? "assembly" : "prepare")
+                  << "\nexplosion_ratio=" << (m_canvas_type == CanvasAssembleView ? GLVolume::explosion_ratio : 1.0f)
+                  << "\nassembly_clipped=" << IsAssembleClipped()
                   << "\nui_quality=" << wxGetApp().app_config->get("render_ao_quality")
                   << "\nstrength=" << GLAOPass::DEFAULT_STRENGTH
                   << "\ndebug=" << wxGetApp().app_config->get("render_ao_debug")
@@ -3306,6 +3351,7 @@ void GLCanvas3D::render(bool only_init, bool overlayOnly)
         show_grid = false;
 
     bool ao_rendered = false;
+    bool ao_scene_cached = false;
     const int hover_id = m_hover_plate_idxs.empty() ? -1 : m_hover_plate_idxs.front();
     MainSceneRenderParams sceneParams;
     sceneParams.onlyCurrent = only_current;
@@ -3319,14 +3365,26 @@ void GLCanvas3D::render(bool only_init, bool overlayOnly)
     const Size sceneCacheSize(viewport[2], viewport[3]);
     int sceneCacheSamples = 0;
     const bool sceneCacheEligible = CanUseSceneCache(sceneCacheSize, targetDrawFramebuffer, sceneCacheSamples);
-    if (m_canvas_type == ECanvasType::CanvasView3D && !fullSceneRefresh && (!sceneCacheEligible || !m_sceneCacheValid))
+    const std::string ao_configuration = std::to_string(static_cast<int>(ResolveAOQualityForView())) + ":" +
+                                         wxGetApp().app_config->get("render_ao_debug");
+    if (IsAOSceneView() && m_sceneCacheValid &&
+        (m_sceneCacheAOConfiguration != ao_configuration ||
+         !camera.get_view_matrix().matrix().isApprox(m_sceneCacheViewMatrix, 0.0) ||
+         !camera.get_projection_matrix().matrix().isApprox(m_sceneCacheProjectionMatrix, 0.0) ||
+         m_sceneCacheResources.width != static_cast<unsigned int>(sceneCacheSize.get_width()) ||
+         m_sceneCacheResources.height != static_cast<unsigned int>(sceneCacheSize.get_height()) ||
+         m_sceneCacheResources.samples != sceneCacheSamples ||
+         (m_canvas_type == CanvasAssembleView && m_sceneCacheExplosionRatio != GLVolume::explosion_ratio)))
+        InvalidateSceneCache();
+    if (IsAOSceneView() && !fullSceneRefresh && (!sceneCacheEligible || !m_sceneCacheValid))
         fullSceneRefresh = true;
 
-    /* view3D render*/
-    if (m_canvas_type == ECanvasType::CanvasView3D) {
+    // Preparation and assembly share opaque rendering/AO and canvas-owned caching.
+    if (IsAOSceneView()) {
         bool sceneReady = false;
         if (!fullSceneRefresh) {
             sceneReady = PresentSceneCache();
+            ao_scene_cached = sceneReady && m_sceneCacheHasAO;
             if (!sceneReady) {
                 InvalidateSceneCache();
                 fullSceneRefresh = true;
@@ -3343,11 +3401,20 @@ void GLCanvas3D::render(bool only_init, bool overlayOnly)
             m_sceneCacheCaptureDeferred = false;
             if (!sceneIsActivelyChanging && sceneCacheEligible && EnsureSceneCacheResources(sceneCacheSize, sceneCacheSamples) &&
                 CaptureSceneCache()) {
+                m_sceneCacheViewMatrix = camera.get_view_matrix().matrix();
+                m_sceneCacheProjectionMatrix = camera.get_projection_matrix().matrix();
+                m_sceneCacheAOConfiguration = ao_configuration;
+                m_sceneCacheExplosionRatio = GLVolume::explosion_ratio;
+                m_sceneCacheHasAO = ao_rendered;
                 m_sceneCacheValid = true;
             }
         }
 
+        if (m_canvas_type == CanvasAssembleView && m_show_world_axes)
+            m_axes.render();
         RenderSelectionBoxWithExplicitState();
+        if (m_canvas_type == CanvasAssembleView)
+            _render_plane();
         _render_objects(GLVolumeCollection::ERenderType::Transparent, !m_gizmos.is_running());
     }
     /* preview render */
@@ -3362,24 +3429,6 @@ void GLCanvas3D::render(bool only_init, bool overlayOnly)
         _render_platelist(camera.get_view_matrix(), camera.get_projection_matrix(), !camera.is_looking_downward(), only_current, true, hover_id);
         // BBS: GUI refactor: add canvas size as parameters
         _render_gcode(cnv_size.get_width(), cnv_size.get_height());
-    }
-    /* assemble render*/
-    else if (m_canvas_type == ECanvasType::CanvasAssembleView) {
-        m_selectionHighlightValid = false;
-        glsafe(::glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT));
-        _render_background();
-        //BBS: add outline logic
-        if (m_show_world_axes) {
-            m_axes.render();
-        }
-        _render_objects(GLVolumeCollection::ERenderType::Opaque, !m_gizmos.is_running());
-        _render_selection();
-        //_render_bed(camera.get_view_matrix(), camera.get_projection_matrix(), !camera.is_looking_downward(), show_axes);
-        _render_plane();
-        //BBS: add outline logic insteadof selection under assemble view
-        //_render_selection();
-        // BBS: add outline logic
-        _render_objects(GLVolumeCollection::ERenderType::Transparent, !m_gizmos.is_running());
     }
 
     if (m_selectionHighlightValid && m_selectionHighlightVolumeIndices != m_selection.get_volume_idxs())
@@ -3458,6 +3507,8 @@ void GLCanvas3D::render(bool only_init, bool overlayOnly)
         ImGui::Separator();
         if (!m_ao_pass.failure_reason().empty())
             imgui.text("AO unavailable: " + m_ao_pass.failure_reason());
+        else if (ao_scene_cached)
+            imgui.text("AO: cached scene");
         else if (ao_rendered && m_ao_pass.has_gpu_sample()) {
             static const char* labels[] = {"AO depth copy", "AO bed receivers", "AO normals", "GTAO", "AO filter", "AO upsample", "AO composite", "AO total"};
             for (size_t i = 0; i < m_ao_pass.gpu_ms().size(); ++i) {
@@ -4594,6 +4645,10 @@ void GLCanvas3D::on_idle(wxIdleEvent& evt)
 {
     if (!m_initialized)
         return;
+    if ((m_ao_comparison_stage || m_ao_pass.benchmark.active()) && !_is_shown_on_screen()) {
+        on_view_deactivated();
+        return;
+    }
 
     m_overlayDirty |= m_main_toolbar.update_items_state();
     //BBS: GUI refactor: GLToolbar
@@ -5078,14 +5133,14 @@ void GLCanvas3D::on_key(wxKeyEvent& evt)
 
     // Opt-in unified AO test. F10 starts/cancels; F11 captures a single frame.
     if (evt.GetEventType() == wxEVT_KEY_UP && evt.ControlDown() && evt.ShiftDown() && keyCode == WXK_F10 &&
-        m_canvas_type == CanvasView3D) {
+        IsAOSceneView()) {
         const char* root = std::getenv("ORCA_AO_COMPARISON_DIR");
         if (root && *root && _set_current()) {
             if (m_ao_comparison_stage) {
                 m_ao_pass.benchmark.finish("ABORTED: comparison cancelled");
                 finish_ao_comparison("ABORTED: cancelled by shortcut");
             } else if (!m_ao_pass.benchmark.active() &&
-                       GLAOPass::resolve_quality(wxGetApp().app_config->get("render_ao_quality"), "") == GLAOPass::Quality::High &&
+                       ResolveAOQualityForView() == GLAOPass::Quality::High &&
                        wxGetApp().app_config->get("render_ao_debug") != "ao" &&
                        wxGetApp().app_config->get("render_ao_debug") != "depth" &&
                        wxGetApp().app_config->get("render_ao_debug") != "normal") {
@@ -5134,7 +5189,7 @@ void GLCanvas3D::on_key(wxKeyEvent& evt)
     // A one-shot GPU capture can be requested after positioning the camera.
     // The capture directory is opt-in so the shortcut has no effect in ordinary sessions.
     if (evt.GetEventType() == wxEVT_KEY_UP && evt.ControlDown() && evt.ShiftDown() && keyCode == WXK_F11 &&
-        m_canvas_type == CanvasView3D) {
+        IsAOSceneView()) {
         const char* capture_dir = std::getenv("ORCA_AO_CAPTURE_DIR");
         if (capture_dir != nullptr && *capture_dir != '\0') {
             if (m_ao_pass.benchmark.active())
@@ -5431,13 +5486,7 @@ void GLCanvas3D::on_mouse_wheel(wxMouseEvent& evt)
             m_explosion_ratio = rotation < 0.f
                 ? std::max(1., m_explosion_ratio - 0.01)
                 : std::min(3., m_explosion_ratio + 0.01);
-            if (m_explosion_ratio != GLVolume::explosion_ratio) {
-                for (GLVolume* volume : m_volumes.volumes) {
-                    volume->set_bounding_boxes_as_dirty();
-                }
-                GLVolume::explosion_ratio = m_explosion_ratio;
-                InvalidateSceneAndPickingCaches();
-            }
+            ApplyExplosionRatio(m_explosion_ratio);
         }
         return;
     }
@@ -8672,9 +8721,17 @@ void GLCanvas3D::SetSelectionAsDirty()
 bool GLCanvas3D::CanUseSceneCache(const Size& canvasSize, int targetDrawFramebuffer, int& samples) const
 {
     samples = 0;
-    if (m_canvas_type != ECanvasType::CanvasView3D || targetDrawFramebuffer != 0 ||
+    if (!IsAOSceneView() || targetDrawFramebuffer != 0 ||
         OpenGLManager::get_framebuffers_type() != OpenGLManager::EFramebufferType::Arb || canvasSize.get_width() <= 0 ||
         canvasSize.get_height() <= 0)
+        return false;
+    // Clipped assembly caps and tools hiding instances retain their original
+    // redraw path; only ordinary opaque assembly scenes are cacheable.
+    if (m_canvas_type == CanvasAssembleView &&
+        (IsAssembleClipped() || m_gizmos.is_hiding_instances() ||
+         (m_gizmos.get_current_type() != GLGizmosManager::Undefined &&
+          m_gizmos.get_current_type() != GLGizmosManager::Move && m_gizmos.get_current_type() != GLGizmosManager::Rotate &&
+          m_gizmos.get_current_type() != GLGizmosManager::Scale && m_gizmos.get_current_type() != GLGizmosManager::Assembly)))
         return false;
 
     GLint redBits = 0;
@@ -8796,34 +8853,69 @@ void GLCanvas3D::ReleaseSceneCacheResources()
     m_sceneCachePresentValidated = false;
 }
 
+bool GLCanvas3D::ApplyExplosionRatio(float ratio)
+{
+    // Another canvas can have restored the global ratio already. Track this
+    // canvas's last applied value as well so its local selection cannot stay stale.
+    if (!m_explosionBoundsDirty && GLVolume::explosion_ratio == ratio && m_appliedExplosionRatio == ratio)
+        return false;
+    m_explosionBoundsDirty    = false;
+    GLVolume::explosion_ratio = ratio;
+    m_appliedExplosionRatio   = ratio;
+    for (GLVolume* volume : m_volumes.volumes)
+        if (volume)
+            volume->set_bounding_boxes_as_dirty();
+    m_selection.invalidate_render_bounds();
+    m_selectionHighlightValid = false;
+    InvalidateSceneAndPickingCaches();
+    request_extra_frame();
+    return true;
+}
+
+bool GLCanvas3D::IsAOSceneView() const { return m_canvas_type == CanvasView3D || m_canvas_type == CanvasAssembleView; }
+
+bool GLCanvas3D::IsAssembleClipped() const
+{
+    return m_canvas_type == CanvasAssembleView &&
+           m_gizmos.get_assemble_view_clipping_plane().get_data() != ClippingPlane::ClipsNothing().get_data();
+}
+
+GLAOPass::Quality GLCanvas3D::ResolveAOQualityForView() const
+{
+    const auto gizmo_type      = m_gizmos.get_current_type();
+    const bool supported_gizmo = gizmo_type == GLGizmosManager::Undefined || gizmo_type == GLGizmosManager::Move ||
+                                 gizmo_type == GLGizmosManager::Rotate || gizmo_type == GLGizmosManager::Scale ||
+                                 (m_canvas_type == CanvasAssembleView && gizmo_type == GLGizmosManager::Assembly);
+    const Size size = get_canvas_size();
+    if (!IsAOSceneView() || !supported_gizmo || size.get_width() < 10 || size.get_height() < 10 || is_layers_editing_enabled() ||
+        is_overhang_shown() || m_use_clipping_planes || IsAssembleClipped() ||
+        (m_canvas_type == CanvasAssembleView && m_gizmos.is_hiding_instances()) || !wxGetApp().is_gl_version_greater_or_equal_to(3, 1))
+        return GLAOPass::Quality::Off;
+    return GLAOPass::resolve_quality(wxGetApp().app_config->get("render_ao_quality"), OpenGLManager::get_gl_info().get_renderer());
+}
+
 bool GLCanvas3D::RenderMainSceneContent(const Camera& camera, const MainSceneRenderParams& params)
 {
-    const Size cnv_size     = get_canvas_size();
-    const auto gizmo_type   = m_gizmos.get_current_type();
-    const bool no_partplate = params.noPartplate, show_axes = params.showAxes;
+    const bool assembly = m_canvas_type == CanvasAssembleView;
+    const bool no_partplate = assembly || params.noPartplate, show_axes = params.showAxes;
     const bool only_current = params.onlyCurrent, only_body = params.onlyBody, show_grid = params.showGrid;
     const int  hover_id     = params.hoverPlateId;
     auto       legacy_scene = [&]() {
         glsafe(::glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT));
         _render_background();
         _render_objects(GLVolumeCollection::ERenderType::Opaque, !m_gizmos.is_running());
-        _render_sla_slices();
-        if (!params.noPartplate)
+        if (!assembly)
+            _render_sla_slices();
+        if (!no_partplate)
             _render_bed(camera.get_view_matrix(), camera.get_projection_matrix(), !camera.is_looking_downward(), params.showAxes);
-        if (!params.noPartplate) {
+        if (!no_partplate) {
             _render_platelist(camera.get_view_matrix(), camera.get_projection_matrix(), !camera.is_looking_downward(), params.onlyCurrent,
                                     params.onlyBody, params.hoverPlateId, true, params.showGrid);
         }
     };
     GLAOPass::Settings ao_settings;
-    // Start with ordinary preparation and transform gizmos; specialized material/clipping modes keep legacy rendering.
-    const bool supported_gizmo = gizmo_type == GLGizmosManager::Undefined || gizmo_type == GLGizmosManager::Move ||
-                                 gizmo_type == GLGizmosManager::Rotate || gizmo_type == GLGizmosManager::Scale;
-    if (supported_gizmo && cnv_size.get_width() >= 10 && cnv_size.get_height() >= 10 && !is_layers_editing_enabled() &&
-        !is_overhang_shown() && !m_use_clipping_planes && wxGetApp().is_gl_version_greater_or_equal_to(3, 1)) {
-        ao_settings.quality = GLAOPass::resolve_quality(wxGetApp().app_config->get("render_ao_quality"),
-                                                        OpenGLManager::get_gl_info().get_renderer());
-    }
+    // Both scene views share quality/backend controls; assembly clipping remains legacy.
+    ao_settings.quality = ResolveAOQualityForView();
     if (m_ao_comparison_stage && m_ao_comparison_qualities && ao_settings.quality != GLAOPass::Quality::Off)
         ao_settings.quality = static_cast<GLAOPass::Quality>(1 + m_ao_comparison_run / 2);
     if (m_ao_comparison_stage && m_ao_comparison_low && ao_settings.quality != GLAOPass::Quality::Off)
@@ -8833,6 +8925,8 @@ bool GLCanvas3D::RenderMainSceneContent(const Camera& camera, const MainSceneRen
     if (ao_settings.quality == GLAOPass::Quality::Off)
         m_ao_pass.benchmark.pipeline("actual_backend=off");
     if (ao_settings.quality != GLAOPass::Quality::Off) {
+        ao_frame.scene_view         = assembly ? "assembly" : "prepare";
+        ao_frame.explosion_ratio    = assembly ? GLVolume::explosion_ratio : 1.0f;
         ao_frame.projection         = camera.get_projection_matrix().matrix();
         ao_frame.inverse_projection = ao_frame.projection.inverse();
         ao_frame.perspective        = camera.get_type() == Camera::EType::Perspective;
@@ -8900,8 +8994,10 @@ bool GLCanvas3D::RenderMainSceneContent(const Camera& camera, const MainSceneRen
                                (m_ao_pass.benchmark.active() && !m_ao_benchmark_pipeline);
         const std::string debug_view = wxGetApp().app_config->get("render_ao_debug");
         ao_settings.debug_view       = debug_view == "depth" ? 1 : debug_view == "normal" ? 2 : debug_view == "ao" ? 3 : 0;
-        // A missing receiver shader must report the same unavailable state as a missing postprocess shader.
-        GLShaderProgram* normal_shader = wxGetApp().get_shader("ao_depth") ? wxGetApp().get_shader("ao_normal") : nullptr;
+        // Assembly has no bed receiver draw and therefore needs no receiver shader.
+        GLShaderProgram* normal_shader = wxGetApp().get_shader("ao_normal");
+        if (!assembly && !wxGetApp().get_shader("ao_depth"))
+            normal_shader = nullptr;
         if (ao_frame.composite_reference &&
             (!wxGetApp().get_shader("ao_composite_reference") ||
              (wxGetApp().is_gl_version_greater_or_equal_to(4, 0) && !ao_frame.sample_composite)))
@@ -8936,9 +9032,12 @@ bool GLCanvas3D::RenderMainSceneContent(const Camera& camera, const MainSceneRen
             glsafe(::glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT));
             _render_background();
             _render_objects(GLVolumeCollection::ERenderType::Opaque, true, true);
-            _render_sla_slices();
+            if (!assembly)
+                _render_sla_slices();
             bed_stage(SceneRenderStage::Surface);
             return m_ao_pass.render(scene_frame, ao_settings, [&]() {
+                if (assembly)
+                    return; // Use the opaque assembly depth, with no virtual ground receiver.
                 GLShaderProgram* shader = wxGetApp().get_shader("ao_depth");
                 shader->start_using();
                 shader->set_uniform("view_model_matrix", camera.get_view_matrix());
@@ -8954,7 +9053,7 @@ bool GLCanvas3D::RenderMainSceneContent(const Camera& camera, const MainSceneRen
         } else {
             // Keep decorations outside AO, but draw them before transparent volumes write depth.
             // The opaque surface pass suppressed its contours; transparent contours stay in their normal pass.
-            if (!m_gizmos.is_hiding_instances()) {
+            if (!assembly && !m_gizmos.is_hiding_instances()) {
                 m_volumes.render_sinking_contours(GLVolumeCollection::ERenderType::Opaque, camera, [this](const GLVolume& volume) {
                     return m_render_sla_auxiliaries || volume.composite_id.volume_id >= 0;
                 });
@@ -11321,7 +11420,8 @@ float GLCanvas3D::_show_assembly_tooltip_information(float caption_max, float x,
 void GLCanvas3D::_render_assemble_control()
 {
     if (m_canvas_type != ECanvasType::CanvasAssembleView) {
-        GLVolume::explosion_ratio = m_explosion_ratio = 1.0;
+        m_explosion_ratio = 1.0f;
+        ApplyExplosionRatio(1.0f);
         return;
     }
     if (m_gizmos.get_current_type() == GLGizmosManager::EType::MmSegmentation) {
@@ -11448,14 +11548,7 @@ void GLCanvas3D::_render_assemble_control()
 
     ImGuiWrapper::pop_toolbar_style();
 
-    //BBS check ratio changed
-    if (m_explosion_ratio != GLVolume::explosion_ratio) {
-        for (GLVolume* volume : m_volumes.volumes) {
-            volume->set_bounding_boxes_as_dirty();
-        }
-        GLVolume::explosion_ratio = m_explosion_ratio;
-        InvalidateSceneAndPickingCaches();
-    }
+    ApplyExplosionRatio(m_explosion_ratio);
 }
 void GLCanvas3D::_render_assemble_info() const
 {

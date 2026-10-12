@@ -10,8 +10,15 @@
 
 #include "GLToolbar.hpp"
 #include "GLPickingBuffer.hpp"
-#include "GLAOPass.hpp"
 #include "GLAOFrameTarget.hpp"
+// Render diagnostics (AO experiments, captures, benchmarks) can be excluded from the build;
+// normal FS/CS rendering works either way. AOConfig supplies the disabled default.
+#include "AO/AOTypes.hpp"
+#include "AO/GLAOFeature.hpp"
+#include "AO/GLAOProgramCatalog.hpp"
+#if ORCA_RENDER_DIAGNOSTICS
+#include "AO/Diagnostics/AODiagnosticsController.hpp"
+#endif
 #include "Event.hpp"
 #include "Selection.hpp"
 #include "ThumbnailView.hpp"     // ThumbnailView enum (kept lightweight, separate from this header)
@@ -662,32 +669,22 @@ private:
     // Screen is only refreshed from the OnIdle handler if it is dirty.
     bool m_dirty;
     // Requests a frame that may reuse the cached main scene.
-    bool m_overlayDirty{ false };
-    GLAOPass m_ao_pass;
+    bool m_overlayDirty{false};
+    // Ambient occlusion: production feature, borrowed program catalog and the diagnostics
+    // controller (observer of the feature). The canvas owns the full-frame target below.
+    AO::GLAOFeature        m_ao_feature;
+    AO::GLAOProgramCatalog m_ao_catalog;
+#if ORCA_RENDER_DIAGNOSTICS
+    AO::AODiagnosticsController m_ao_diagnostics;
+#endif
+    // Actual facts are also used by the production scene cache.
+    AO::AOResult    m_last_ao_result;
     GLAOFrameTarget m_ao_frame_target;
-    bool m_ownedFrameLastRender{false};
-    std::string m_frameTargetFallbackReason;
-    int             m_ao_comparison_stage{0}; // 0 idle, 1 measuring, 2 capturing
-    bool            m_ao_comparison_filter{false};
-    bool            m_ao_comparison_denoise{false};
-    bool            m_ao_comparison_sampling{false};
-    bool            m_ao_comparison_composite{false};
-    bool            m_ao_comparison_confidence{false};
-    bool            m_ao_comparison_split{false};
-    bool            m_ao_comparison_pixel{false}, m_ao_comparison_pixel_fs{false};
-    bool            m_ao_comparison_reconstruction{false};
-    bool            m_ao_comparison_backends{false};
-    bool            m_ao_comparison_low{false};
-    bool            m_ao_comparison_qualities{false}; // One CS/FS pair for each quality preset.
-    int m_ao_comparison_run{0}; // Three alternating default/directions pairs.
-    std::string m_ao_comparison_root, m_ao_comparison_signature, m_ao_comparison_capture;
-    void finish_ao_comparison(const std::string& reason);
-    bool next_ao_comparison_run();
-    void advance_ao_comparison();
+    bool            m_ownedFrameLastRender{false};
+    std::string     m_frameTargetFallbackReason;
+    // Cache invalidation key derived from the request and the actual result signature.
+    std::string m_sceneCacheAOSignature;
 
-    bool m_ao_benchmark_reuse{false}; // Benchmark variant only; normal rendering uses the validated reuse shader.
-    bool m_ao_benchmark_filter_reuse{false}; // Benchmark variant only; normal rendering uses the validated reuse filter.
-    bool     m_ao_benchmark_pipeline{false};     // Unified tests measure the complete selected pipeline.
     bool m_initialized;
     //BBS: add flag to controll rendering
     bool m_render_preview{ true };
@@ -876,7 +873,7 @@ public:
     void set_context(wxGLContext* context);
     // Called before hiding this canvas so a comparison cannot resume across a view switch.
     void on_view_deactivated();
-    const std::string& get_ao_failure_reason() const { return m_ao_pass.failure_reason(); }
+    const std::string& get_ao_failure_reason() const { return m_ao_feature.failure_reason(); }
     void set_type(ECanvasType type) { if (m_canvas_type != type) InvalidateSceneAndPickingCaches(); m_canvas_type = type; }
     ECanvasType get_canvas_type() { return m_canvas_type; }
 
@@ -1437,7 +1434,7 @@ private:
     bool IsAOSceneView() const;
     bool ApplyExplosionRatio(float ratio);
     bool IsAssembleClipped() const;
-    GLAOPass::Quality ResolveAOQualityForView() const;
+    AO::AOSettings::Quality ResolveAOQualityForView() const;
     /** @brief Checks whether the current view, target and framebuffer format support Scene Cache. */
     bool CanUseSceneCache(const Size& canvasSize, int targetDrawFramebuffer, int& samples) const;
     /** @brief Creates or reuses Scene Cache framebuffer resources for the requested specification. */
@@ -1448,16 +1445,25 @@ private:
     bool CaptureSceneCache();
     /** @brief Copies cached color and depth into the window framebuffer. */
     bool PresentSceneCache();
-    /** @brief Selects one AO/frame-target configuration before cache and drawing decisions. */
+    /** @brief Selects one AO request/frame-target configuration before cache and drawing decisions. */
     struct AOFramePlan
     {
-        GLAOPass::Frame    frame;
-        GLAOPass::Settings settings;
-        GLAOPass::Shaders  shaders{};
-        bool               owned_target{false};
-        bool               strict_target{false};
+        AO::AOExecutionRequest request;
+        AO::AOSettings         settings;
+        bool                   owned_target{false};
+        bool                   strict_target{false};
+        bool                   sample_capture{false};
+        // Borrowed GL targets/projection snapshot filled by the canvas while the context is current.
+        AO::AOFrameInput input;
+        // Diagnostic tags (static literal from the canvas; not part of the frame input).
+        const char* scene_view{"external"};
+        float       explosion_ratio{1.0f};
     };
-    AOFramePlan BuildAOFramePlan(const Camera& camera) const;
+    AOFramePlan BuildAOFramePlan(const Camera& camera);
+#if ORCA_RENDER_DIAGNOSTICS
+    /** @brief Stops any AO experiment/capture and schedules one more frame. */
+    void finish_ao_diagnostics(const std::string& reason);
+#endif
     /** @brief Draws preparation/assembly opaque content in the selected target. */
     bool        RenderMainSceneContent(const Camera& camera, const MainSceneRenderParams& params, const AOFramePlan& plan);
     /** @brief Draws the selection box after scene presentation with explicit depth and blend state. */
